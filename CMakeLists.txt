@@ -31,4 +31,5 @@ include_directories("${PROJECT_SOURCE_DIR}" "/home/atr/local/include/")
 
 add_executable(rdma_server ${PROJECT_SOURCE_DIR}/rdma_common.c ${PROJECT_SOURCE_DIR}/rdma_server.c)
 add_executable(rdma_client ${PROJECT_SOURCE_DIR}/rdma_common.c ${PROJECT_SOURCE_DIR}/rdma_client.c)
+add_executable(my_server ${PROJECT_SOURCE_DIR}/rdma_common.c ${PROJECT_SOURCE_DIR}/my_server.c)
 
