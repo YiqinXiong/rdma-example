@@ -55,6 +55,13 @@ struct memory_resources {
   ibv_sge client_recv_sge{}, server_send_sge{};
 };
 
+static void print_array_data(void * buffer) {
+  unsigned long result_length = *(unsigned long *)buffer;
+  char *result_data = (char *)buffer + sizeof(unsigned long);
+  result_data[result_length] = '\0';
+  printf("\nBuffer length:%lu, data:%s\n", result_length, result_data);
+}
+
 /* When we call this function cm_client_id must be set to a valid identifier.
  * This is where, we prepare client connection before we accept it. This
  * mainly involve pre-posting a receive buffer to receive client side
@@ -79,7 +86,7 @@ static bool setup_client_resources(client_resources &client_rc) {
     LOG(my_error, "Failed to allocate a protection domain!\n");
     return false;
   }
-  debug("A new protection domain is allocated at %p \n", client_rc.pd);
+  printf("A new protection domain is allocated at %p \n", client_rc.pd);
   /* Now we need a completion channel, were the I/O completion
    * notifications are sent. Remember, this is different from connection
    * management (CM) event notifications.
@@ -91,7 +98,7 @@ static bool setup_client_resources(client_resources &client_rc) {
     LOG(my_error, "Failed to create an I/O completion event channel!\n");
     return false;
   }
-  debug("An I/O completion event channel is created at %p \n",
+  printf("An I/O completion event channel is created at %p \n",
         client_rc.comp_channel);
   /* Now we create a completion queue (CQ) where actual I/O
    * completion metadata is placed. The metadata is packed into a structure
@@ -108,7 +115,7 @@ static bool setup_client_resources(client_resources &client_rc) {
     LOG(my_error, "Failed to create a completion queue (cq)!\n");
     return false;
   }
-  debug("Completion queue (CQ) is created at %p with %d elements \n",
+  printf("Completion queue (CQ) is created at %p with %d elements \n",
         client_rc.cq, client_rc.cq->cqe);
   /* Ask for the event for all activities in the completion queue*/
   if (ibv_req_notify_cq(client_rc.cq /* on which CQ */,
@@ -145,7 +152,7 @@ static bool setup_client_resources(client_resources &client_rc) {
   }
   /* Save the reference for handy typing but is not required */
   client_rc.qp = client_rc.id->qp;
-  debug("Client QP created at %p\n", client_rc.qp);
+  printf("Client QP created at %p\n", client_rc.qp);
   return true;
 }
 
@@ -178,7 +185,7 @@ static bool accept_client_connection(rdma_event_channel *cm_event_channel,
       (uint64_t)mem_rc.client_metadata_mr->addr;  // same as &client_buffer_attr
   mem_rc.client_recv_sge.length = mem_rc.client_metadata_mr->length;
   mem_rc.client_recv_sge.lkey = mem_rc.client_metadata_mr->lkey;
-  debug("Regist client_recv_sge addr=%p, length=%u\n",
+  printf("Regist client_recv_sge addr=%p, length=%u\n",
         mem_rc.client_recv_sge.addr, mem_rc.client_recv_sge.length);
   /* Now we link this SGE to the work request (WR) */
   bzero(&mem_rc.client_recv_wr, sizeof(mem_rc.client_recv_wr));
@@ -190,7 +197,7 @@ static bool accept_client_connection(rdma_event_channel *cm_event_channel,
     LOG(my_error, "Failed to pre-post the receive buffer\n");
     return false;
   }
-  debug("Receive buffer pre-posting is successful \n");
+  printf("Receive buffer pre-posting is successful \n");
   /* Now we accept the connection. Recall we have not accepted the connection
    * yet because we have to do lots of resource pre-allocation */
   memset(&conn_param, 0, sizeof(conn_param));
@@ -208,7 +215,7 @@ static bool accept_client_connection(rdma_event_channel *cm_event_channel,
    * connection has been established and everything is fine on both, server
    * as well as the client sides.
    */
-  debug("Going to wait for : RDMA_CM_EVENT_ESTABLISHED event \n");
+  printf("Going to wait for : RDMA_CM_EVENT_ESTABLISHED event \n");
   if (process_rdma_cm_event(cm_event_channel, RDMA_CM_EVENT_ESTABLISHED,
                             &cm_event)) {
     LOG(my_error, "Failed to get the cm event\n");
@@ -299,7 +306,7 @@ static bool receive_compaction_param(client_resources &client_rc,
         "We failed to get 1 work completions (RDMA_READ from client)\n");
     return false;
   }
-  debug("receive_compaction_param RDMA_READ from client success.\n");
+  printf("receive_compaction_param RDMA_READ from client success.\n");
   return true;
 }
 
@@ -334,7 +341,7 @@ static bool send_compaction_result(client_resources &client_rc,
         "We failed to get 1 work completions (RDMA_WRITE to client)\n");
     return false;
   }
-  debug("send_compaction_result RDMA_WRITE to client success.\n");
+  printf("send_compaction_result RDMA_WRITE to client success.\n");
   return true;
 }
 
@@ -393,7 +400,7 @@ static bool send_compaction_result(client_resources &client_rc,
 //     LOG(my_error, "Failed to send server metadata!\n");
 //     return false;
 //   }
-//   debug("Local buffer metadata has been sent to the client \n");
+//   printf("Local buffer metadata has been sent to the client \n");
 //   return true;
 // }
 
@@ -408,7 +415,7 @@ static bool disconnect_and_cleanup(rdma_event_channel *cm_event_channel,
     LOG(my_error, "Failed to disconnect\n");
   }
   /* Now we wait for the client to send us disconnect event */
-  debug("Waiting for cm event: RDMA_CM_EVENT_DISCONNECTED\n");
+  printf("Waiting for cm event: RDMA_CM_EVENT_DISCONNECTED\n");
   if (process_rdma_cm_event(cm_event_channel, RDMA_CM_EVENT_DISCONNECTED,
                             &cm_event)) {
     LOG(my_error, "Failed to get disconnect event\n");
@@ -544,7 +551,7 @@ class RemoteCompactionServer {
         if (rdma_ack_cm_event(cm_event)) {
           throw "rdma_ack_cm_event error";
         }
-        debug("A new RDMA client connection id is stored at %p\n",
+        printf("A new RDMA client connection id is stored at %p\n",
               cm_client_id);
         pool_.enqueue(&RemoteCompactionServer::RunJob, this, cm_client_id,
                       task_id++);
@@ -590,6 +597,7 @@ class RemoteCompactionServer {
       LOG(my_error, "receive_compaction_param error!\n");
       return;
     }
+    print_array_data(buf);
     size_t param_length = *(size_t *)buf;
     void *param_buf = (char *)buf + sizeof(size_t);
 
@@ -614,6 +622,7 @@ class RemoteCompactionServer {
         task_id);
     // Send Result
     SendResult(result, buf);
+    print_array_data(buf);
     if (!send_compaction_result(client_rc, mem_rc)) {
       LOG(my_error, "send_compaction_result error!\n");
       return;

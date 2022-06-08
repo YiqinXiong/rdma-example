@@ -24,6 +24,13 @@ static struct ibv_sge client_send_sge;
 // static char *src = NULL, *dst = NULL;
 static char *buf = NULL;
 
+static void print_array_data(void *buffer) {
+  unsigned long result_length = *(unsigned long *)buffer;
+  char *result_data = (char *)buffer + sizeof(unsigned long);
+  result_data[result_length] = '\0';
+  printf("\nBuffer length:%lu, data:%s\n", result_length, result_data);
+}
+
 /* This function prepares client side connection resources for an RDMA
  * connection */
 static int client_prepare_connection(struct sockaddr_in *s_addr) {
@@ -375,10 +382,9 @@ int main(int argc, char **argv) {
     return ret;
   }
 
-  unsigned long result_length = *(unsigned long *)buf;
-  char *result_data = (char *)buf + sizeof(unsigned long);
-  result_data[result_length] = '\0';
-  printf("Get result length:%lu, data:%s", result_length, result_data);
+  print_array_data(buf);
+  printf("client_buffer_mr->addr=%p, buf addr=%p\n", client_buffer_mr->addr,
+         buf);
 
   ret = client_disconnect_and_clean();
   if (ret) {
