@@ -1,5 +1,7 @@
 #include <arpa/inet.h>
+#include <infiniband/verbs.h>
 #include <netinet/in.h>
+#include <rdma/rdma_cma.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -46,9 +48,8 @@ struct client_resources {
 };
 
 struct memory_resources {
-  ibv_mr *client_metadata_mr = nullptr, *server_buffer_mr = nullptr,
-         *server_metadata_mr = nullptr;
-  rdma_buffer_attr client_metadata_attr{}, server_metadata_attr{};
+  ibv_mr *client_metadata_mr = nullptr, *server_buffer_mr = nullptr;
+  rdma_buffer_attr client_metadata_attr{};
   ibv_recv_wr client_recv_wr, *bad_client_recv_wr = nullptr;
   ibv_send_wr server_send_wr, *bad_server_send_wr = nullptr;
   ibv_sge client_recv_sge{}, server_send_sge{};
@@ -177,6 +178,8 @@ static bool accept_client_connection(rdma_event_channel *cm_event_channel,
       (uint64_t)mem_rc.client_metadata_mr->addr;  // same as &client_buffer_attr
   mem_rc.client_recv_sge.length = mem_rc.client_metadata_mr->length;
   mem_rc.client_recv_sge.lkey = mem_rc.client_metadata_mr->lkey;
+  debug("Regist client_recv_sge addr=%p, length=%u\n",
+        mem_rc.client_recv_sge.addr, mem_rc.client_recv_sge.length);
   /* Now we link this SGE to the work request (WR) */
   bzero(&mem_rc.client_recv_wr, sizeof(mem_rc.client_recv_wr));
   mem_rc.client_recv_wr.sg_list = &mem_rc.client_recv_sge;
@@ -225,9 +228,9 @@ static bool accept_client_connection(rdma_event_channel *cm_event_channel,
   return true;
 }
 
-/* This function sends server side buffer metadata to the connected client */
-static bool send_server_metadata_to_client(const client_resources &client_rc,
-                                           memory_resources &mem_rc) {
+/* Wait until we receive client buffer metadata*/
+static bool wait_receive_client_metadata(client_resources &client_rc,
+                                         memory_resources &mem_rc) {
   struct ibv_wc wc;
   /* Now, we first wait for the client to start the communication by
    * sending the server its metadata info. The server does not use it
@@ -241,71 +244,158 @@ static bool send_server_metadata_to_client(const client_resources &client_rc,
   /* if all good, then we should have client's buffer information, lets see */
   printf("Client side buffer information is received...\n");
   show_rdma_buffer_attr(&mem_rc.client_metadata_attr);
-  printf("The client has requested buffer length of : %u bytes \n",
+  printf("The client buffer's size : %u bytes \n",
          mem_rc.client_metadata_attr.length);
+  return true;
+}
+
+/* Regist server buffer as 'dst' of RDMA_READ and 'src' of RDMA_WRITE */
+static bool regist_server_buffer(void *buf, client_resources &client_rc,
+                                 memory_resources &mem_rc) {
   /* We need to setup requested memory buffer. This is where the client will
    * do RDMA READs and WRITEs. */
-  mem_rc.server_buffer_mr = rdma_buffer_alloc(
-      client_rc.pd /* which protection domain */,
+  mem_rc.server_buffer_mr = rdma_buffer_register(
+      client_rc.pd /* which protection domain */, buf /* what memory*/,
       mem_rc.client_metadata_attr.length /* what size to allocate */,
-      (IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
-       IBV_ACCESS_REMOTE_WRITE) /* access permissions */);
+      (enum ibv_access_flags)(
+          IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
+          IBV_ACCESS_REMOTE_WRITE) /* access permissions */);
   if (!mem_rc.server_buffer_mr) {
     LOG(my_error, "Server failed to create a buffer!\n");
     /* we assume that it is due to out of memory error */
     return false;
   }
-  /* This buffer is used to transmit information about the above
-   * buffer to the client. So this contains the metadata about the server
-   * buffer. Hence this is called metadata buffer. Since this is already
-   * on allocated, we just register it.
-   * We need to prepare a send I/O operation that will tell the
-   * client the address of the server buffer.
-   */
-  mem_rc.server_metadata_attr.address = (uint64_t)mem_rc.server_buffer_mr->addr;
-  mem_rc.server_metadata_attr.length =
-      (uint32_t)mem_rc.server_buffer_mr->length;
-  mem_rc.server_metadata_attr.stag.local_stag =
-      (uint32_t)mem_rc.server_buffer_mr->lkey;
-  mem_rc.server_metadata_mr = rdma_buffer_register(
-      client_rc.pd /* which protection domain*/,
-      &mem_rc.server_metadata_attr /* which memory to register */,
-      sizeof(mem_rc.server_metadata_attr) /* what is the size of memory */,
-      IBV_ACCESS_LOCAL_WRITE /* what access permission */);
-  if (!mem_rc.server_metadata_mr) {
-    LOG(my_error, "Server failed to create to hold server metadata!\n");
-    /* we assume that it is due to out of memory error */
-    return false;
-  }
-  /* We need to transmit this buffer. So we create a send request.
-   * A send request consists of multiple SGE elements. In our case, we only
-   * have one
-   */
-  mem_rc.server_send_sge.addr = (uint64_t)&mem_rc.server_metadata_attr;
-  mem_rc.server_send_sge.length = sizeof(mem_rc.server_metadata_attr);
-  mem_rc.server_send_sge.lkey = mem_rc.server_metadata_mr->lkey;
-  /* now we link this sge to the send request */
-  bzero(&mem_rc.server_send_wr, sizeof(mem_rc.server_send_wr));
-  mem_rc.server_send_wr.sg_list = &mem_rc.server_send_sge;
-  mem_rc.server_send_wr.num_sge = 1;  // only 1 SGE element in the array
-  mem_rc.server_send_wr.opcode = IBV_WR_SEND;  // This is a send request
-  mem_rc.server_send_wr.send_flags =
-      IBV_SEND_SIGNALED;  // We want to get notification
-  /* This is a fast data path operation. Posting an I/O request */
-  if (ibv_post_send(
-      client_rc.qp /* which QP */,
-      &mem_rc.server_send_wr /* Send request that we prepared before */, &mem_rc.bad_server_send_wr /* In case of error, this will contain failed requests */)) {
-    LOG(my_error, "Posting of server metdata failed!\n");
-    return false;
-  }
-  /* We check for completion notification */
-  if (process_work_completion_events(client_rc.comp_channel, &wc, 1) != 1) {
-    LOG(my_error, "Failed to send server metadata!\n");
-    return false;
-  }
-  debug("Local buffer metadata has been sent to the client \n");
   return true;
 }
+
+/* RDMA_READ: Receive serialized CompactionParam to server buffer */
+static bool receive_compaction_param(client_resources &client_rc,
+                                     memory_resources &mem_rc) {
+  struct ibv_wc wc;
+  /* Now we prepare a READ */
+  mem_rc.server_send_sge.addr = (uint64_t)mem_rc.server_buffer_mr->addr;
+  mem_rc.server_send_sge.length = (uint32_t)mem_rc.server_buffer_mr->length;
+  mem_rc.server_send_sge.lkey = mem_rc.server_buffer_mr->lkey;
+  /* now we link to the send work request */
+  bzero(&mem_rc.server_send_wr, sizeof(mem_rc.server_send_wr));
+  mem_rc.server_send_wr.sg_list = &mem_rc.server_send_sge;
+  mem_rc.server_send_wr.num_sge = 1;
+  mem_rc.server_send_wr.opcode = IBV_WR_RDMA_READ;
+  mem_rc.server_send_wr.send_flags = IBV_SEND_SIGNALED;
+  /* we have to tell client side info for RDMA */
+  mem_rc.server_send_wr.wr.rdma.rkey =
+      mem_rc.client_metadata_attr.stag.remote_stag;
+  mem_rc.server_send_wr.wr.rdma.remote_addr =
+      mem_rc.client_metadata_attr.address;
+  /* Now we post it */
+  if (ibv_post_send(client_rc.qp, &mem_rc.server_send_wr,
+                    &mem_rc.bad_server_send_wr)) {
+    LOG(my_error, "Failed to read client dst buffer from the master\n");
+    return false;
+  }
+  /* at this point we are expecting 1 work completion for the write */
+  if (process_work_completion_events(client_rc.comp_channel, &wc, 1) != 1) {
+    LOG(my_error,
+        "We failed to get 1 work completions (RDMA_READ from client)\n");
+    return false;
+  }
+  debug("receive_compaction_param RDMA_READ from client success.\n");
+  return true;
+}
+
+/* RDMA_WRITE: Receive serialized CompactionParam to server buffer */
+static bool send_compaction_result(client_resources &client_rc,
+                                   memory_resources &mem_rc) {
+  struct ibv_wc wc;
+  /* Now we prepare a WRITE */
+  mem_rc.server_send_sge.addr = (uint64_t)mem_rc.server_buffer_mr->addr;
+  mem_rc.server_send_sge.length = (uint32_t)mem_rc.server_buffer_mr->length;
+  mem_rc.server_send_sge.lkey = mem_rc.server_buffer_mr->lkey;
+  /* now we link to the send work request */
+  bzero(&mem_rc.server_send_wr, sizeof(mem_rc.server_send_wr));
+  mem_rc.server_send_wr.sg_list = &mem_rc.server_send_sge;
+  mem_rc.server_send_wr.num_sge = 1;
+  mem_rc.server_send_wr.opcode = IBV_WR_RDMA_WRITE;
+  mem_rc.server_send_wr.send_flags = IBV_SEND_SIGNALED;
+  /* we have to tell client side info for RDMA */
+  mem_rc.server_send_wr.wr.rdma.rkey =
+      mem_rc.client_metadata_attr.stag.remote_stag;
+  mem_rc.server_send_wr.wr.rdma.remote_addr =
+      mem_rc.client_metadata_attr.address;
+  /* Now we post it */
+  if (ibv_post_send(client_rc.qp, &mem_rc.server_send_wr,
+                    &mem_rc.bad_server_send_wr)) {
+    LOG(my_error, "Failed to read client dst buffer from the master\n");
+    return false;
+  }
+  /* at this point we are expecting 1 work completion for the write */
+  if (process_work_completion_events(client_rc.comp_channel, &wc, 1) != 1) {
+    LOG(my_error,
+        "We failed to get 1 work completions (RDMA_WRITE to client)\n");
+    return false;
+  }
+  debug("send_compaction_result RDMA_WRITE to client success.\n");
+  return true;
+}
+
+// /* This function sends server side buffer metadata to the connected client */
+// static bool send_server_metadata_to_client(const client_resources &client_rc,
+//                                            memory_resources &mem_rc) {
+//   struct ibv_wc wc;
+//   /* This buffer is used to transmit information about the above
+//    * buffer to the client. So this contains the metadata about the server
+//    * buffer. Hence this is called metadata buffer. Since this is already
+//    * on allocated, we just register it.
+//    * We need to prepare a send I/O operation that will tell the
+//    * client the address of the server buffer.
+//    */
+//   mem_rc.server_metadata_attr.address =
+//   (uint64_t)mem_rc.server_buffer_mr->addr; mem_rc.server_metadata_attr.length
+//   =
+//       (uint32_t)mem_rc.server_buffer_mr->length;
+//   mem_rc.server_metadata_attr.stag.local_stag =
+//       (uint32_t)mem_rc.server_buffer_mr->lkey;
+//   mem_rc.server_metadata_mr = rdma_buffer_register(
+//       client_rc.pd /* which protection domain*/,
+//       &mem_rc.server_metadata_attr /* which memory to register */,
+//       sizeof(mem_rc.server_metadata_attr) /* what is the size of memory */,
+//       IBV_ACCESS_LOCAL_WRITE /* what access permission */);
+//   if (!mem_rc.server_metadata_mr) {
+//     LOG(my_error, "Server failed to create to hold server metadata!\n");
+//     /* we assume that it is due to out of memory error */
+//     return false;
+//   }
+//   /* We need to transmit this buffer. So we create a send request.
+//    * A send request consists of multiple SGE elements. In our case, we only
+//    * have one
+//    */
+//   mem_rc.server_send_sge.addr = (uint64_t)&mem_rc.server_metadata_attr;
+//   mem_rc.server_send_sge.length = sizeof(mem_rc.server_metadata_attr);
+//   mem_rc.server_send_sge.lkey = mem_rc.server_metadata_mr->lkey;
+//   /* now we link this sge to the send request */
+//   bzero(&mem_rc.server_send_wr, sizeof(mem_rc.server_send_wr));
+//   mem_rc.server_send_wr.sg_list = &mem_rc.server_send_sge;
+//   mem_rc.server_send_wr.num_sge = 1;  // only 1 SGE element in the array
+//   mem_rc.server_send_wr.opcode = IBV_WR_SEND;  // This is a send request
+//   mem_rc.server_send_wr.send_flags =
+//       IBV_SEND_SIGNALED;  // We want to get notification
+//   /* This is a fast data path operation. Posting an I/O request */
+//   if (ibv_post_send(
+//       client_rc.qp /* which QP */,
+//       &mem_rc.server_send_wr /* Send request that we prepared before */,
+//       &mem_rc.bad_server_send_wr /* In case of error, this will contain
+//       failed requests */)) {
+//     LOG(my_error, "Posting of server metdata failed!\n");
+//     return false;
+//   }
+//   /* We check for completion notification */
+//   if (process_work_completion_events(client_rc.comp_channel, &wc, 1) != 1) {
+//     LOG(my_error, "Failed to send server metadata!\n");
+//     return false;
+//   }
+//   debug("Local buffer metadata has been sent to the client \n");
+//   return true;
+// }
 
 /* This is server side logic. Server passively waits for the client to call
  * rdma_disconnect() and then it will clean up its resources */
@@ -313,17 +403,19 @@ static bool disconnect_and_cleanup(rdma_event_channel *cm_event_channel,
                                    client_resources &client_rc,
                                    memory_resources &mem_rc) {
   struct rdma_cm_event *cm_event = NULL;
+  /* Active DISCONNECT from server side */
+  if (rdma_disconnect(client_rc.id)) {
+    LOG(my_error, "Failed to disconnect\n");
+  }
   /* Now we wait for the client to send us disconnect event */
   debug("Waiting for cm event: RDMA_CM_EVENT_DISCONNECTED\n");
   if (process_rdma_cm_event(cm_event_channel, RDMA_CM_EVENT_DISCONNECTED,
                             &cm_event)) {
     LOG(my_error, "Failed to get disconnect event\n");
-    return false;
   }
   /* We acknowledge the event */
   if (rdma_ack_cm_event(cm_event)) {
     LOG(my_error, "Failed to acknowledge the cm event\n");
-    return false;
   }
   printf("A disconnect event is received from the client...\n");
   /* We free all the resources */
@@ -345,9 +437,8 @@ static bool disconnect_and_cleanup(rdma_event_channel *cm_event_channel,
     // we continue anyways;
   }
   /* Destroy memory buffers */
-  rdma_buffer_free(mem_rc.server_buffer_mr);
-  rdma_buffer_deregister(mem_rc.server_metadata_mr);
   rdma_buffer_deregister(mem_rc.client_metadata_mr);
+  rdma_buffer_deregister(mem_rc.server_buffer_mr);
   /* Destroy protection domain */
   if (ibv_dealloc_pd(client_rc.pd)) {
     LOG(my_error, "Failed to destroy client protection domain cleanly\n");
@@ -395,17 +486,18 @@ class RemoteCompactionServer {
   void SetupServer() {
     try {
       /*  Open a channel used to report asynchronous communication event */
-      if (!(cm_event_channel = rdma_create_event_channel())) {
+      if (!(cm_event_channel_ = rdma_create_event_channel())) {
         throw "rdma_create_event_channel error!";
       }
       /* rdma_cm_id is the connection identifier (like socket) which is used
        * to define an RDMA connection.
        */
-      if (rdma_create_id(cm_event_channel, &cm_server_id, NULL, RDMA_PS_TCP)) {
+      if (rdma_create_id(cm_event_channel_, &cm_server_id_, NULL,
+                         RDMA_PS_TCP)) {
         throw "rdma_create_id error!";
       }
       /* Explicit binding of rdma cm id to the socket credentials */
-      if (rdma_bind_addr(cm_server_id, (struct sockaddr *)&my_addr)) {
+      if (rdma_bind_addr(cm_server_id_, (struct sockaddr *)&my_addr)) {
         throw "bind error!";
       }
       /* Now we start to listen on the passed IP and port. However unlike
@@ -414,7 +506,7 @@ class RemoteCompactionServer {
        * RDMA CM event channel from where the listening id was created. Here we
        * have only one channel, so it is easy. */
       /* backlog = 8 clients, same as TCP, see man listen*/
-      if (rdma_listen(cm_server_id, 8)) {
+      if (rdma_listen(cm_server_id_, 8)) {
         throw "listen error!";
       }
     } catch (char const *s) {
@@ -434,7 +526,7 @@ class RemoteCompactionServer {
          * RDMA_CM_EVNET_CONNECT_REQUEST We wait (block) on the connection
          * management event channel for the connect event.
          */
-        if (process_rdma_cm_event(cm_event_channel,
+        if (process_rdma_cm_event(cm_event_channel_,
                                   RDMA_CM_EVENT_CONNECT_REQUEST, &cm_event)) {
           throw "process_rdma_cm_event error!";
         }
@@ -477,57 +569,73 @@ class RemoteCompactionServer {
       LOG(my_error, "setup_client_resources error!\n");
       return;
     }
-    if (!accept_client_connection(cm_event_channel, client_rc, mem_rc)) {
+    if (!accept_client_connection(cm_event_channel_, client_rc, mem_rc)) {
       LOG(my_error, "accept_client_connection error!\n");
       return;
     }
-    if (!send_server_metadata_to_client(client_rc, mem_rc)) {
-      LOG(my_error, "send_server_metadata_to_client error!\n");
+    if (!wait_receive_client_metadata(client_rc, mem_rc)) {
+      LOG(my_error, "wait_receive_client_metadata error!\n");
       return;
     }
-    if (!disconnect_and_cleanup(cm_event_channel, client_rc, mem_rc)) {
-      LOG(my_error, "disconnect_and_cleanup error!\n");
+    void *buf = calloc(mem_rc.client_metadata_attr.length, 1);
+    if (!regist_server_buffer(buf, client_rc, mem_rc)) {
+      LOG(my_error, "regist_server_buffer error!\n");
       return;
     }
 
-    
-    // variables
-    void *send_buf = malloc(MAX_BUF_SIZE);
-    void *recv_buf = malloc(MAX_BUF_SIZE);
     string param;
     string result;
     string db_name;
+    if (!receive_compaction_param(client_rc, mem_rc)) {
+      LOG(my_error, "receive_compaction_param error!\n");
+      return;
+    }
+    size_t param_length = *(size_t *)buf;
+    void *param_buf = (char *)buf + sizeof(size_t);
+
 // Receive Param or CleanUp
 #ifdef USE_SECONDARY_POOL
     if (!ReceiveParamOrCleanUp(param, db_name, client_cm_id, recv_buf,
                                MAX_BUF_SIZE, task_id,
                                secondary_dbs_[thread_id])) {
 #else
-    if (!ReceiveParamOrCleanUp(param, db_name, client_cm_id, recv_buf,
-                               MAX_BUF_SIZE, task_id)) {
+    if (!ReceiveParamOrCleanUp(param, db_name, param_buf, param_length,
+                               task_id)) {
 #endif
-
       return;
     }
     // Do Compact
     std::this_thread::sleep_for(std::chrono::seconds(6));
-    LOG(my_debug, "param=%s\n", param);
+    LOG(my_debug, "param=%s\n", param.c_str());
     char tmpres[20];
     sprintf(tmpres, "my_result_%d", task_id);
     result.assign(tmpres);
     LOG(my_info, "thread %3d: [%d] Finish compaction, Get result\n", thread_id,
         task_id);
     // Send Result
-    SendResult(result, client_cm_id, send_buf);
+    SendResult(result, buf);
+    if (!send_compaction_result(client_rc, mem_rc)) {
+      LOG(my_error, "send_compaction_result error!\n");
+      return;
+    }
+
     // #ifndef USE_SECONDARY_POOL
     //     delete secondary;  // Close current secondary
     //     secondary = nullptr;
     // #endif
 
+    // if (!send_server_metadata_to_client(client_rc, mem_rc)) {
+    //   LOG(my_error, "send_server_metadata_to_client error!\n");
+    //   return;
+    // }
+    if (!disconnect_and_cleanup(cm_event_channel_, client_rc, mem_rc)) {
+      LOG(my_error, "disconnect_and_cleanup error!\n");
+      return;
+    }
+
     // Thread End
     LOG(my_info, "thread %3d: [%d] Thread End\n", thread_id, task_id);
-    free(send_buf);
-    free(recv_buf);
+    free(buf);
   }
 
 // Receive compactionParam or clean-up
@@ -537,18 +645,18 @@ class RemoteCompactionServer {
                              void *recv_buf, size_t max_buf_size, int task_id,
                              std::unordered_map<string, DB *> &secondary_map) {
 #else
-  bool ReceiveParamOrCleanUp(string &param, std::string &db_name,
-                             rdma_cm_id *client_cm_id, void *recv_buf,
-                             size_t max_buf_size, int task_id) {
+  bool ReceiveParamOrCleanUp(string &param, std::string &db_name, void *buf,
+                             size_t buf_length, int task_id) {
 #endif
-    string recv_string;
     string proto_param;
     // 1. receive Array from client
     // recv_string =
 
     // 2. Array -> ProtoParam
     // LOG(my_info, "[%d] Begin Array -> ProtoParam\n", task_id);
-    proto_param = recv_string;
+    char *recv_string_ptr = (char *)buf;
+    recv_string_ptr[buf_length] = '\0';
+    proto_param.assign(recv_string_ptr);
     // Get param
     ParseCompactionParamFromProto(param, proto_param);
 
@@ -556,13 +664,14 @@ class RemoteCompactionServer {
   }
 
   // Send Result
-  static void SendResult(const string &result, rdma_cm_id *client_fd,
-                         void *send_buf) {
+  static void SendResult(const string &result, void *send_buf) {
     // 1. Result -> ProtoResult
     string proto_result;
     SerializeCompactionResultToProto(proto_result, result);
     // 2. ProtoResult -> Array
-    memcpy(send_buf, proto_result.c_str(), proto_result.length() + 1);
+    *(size_t *)send_buf = (size_t)proto_result.length();
+    memcpy(send_buf + sizeof(size_t), proto_result.c_str(),
+           proto_result.length() + 1);
     // 3. send Array to client
     ;
 
@@ -588,22 +697,8 @@ class RemoteCompactionServer {
   /* These are the RDMA resources needed to setup an RDMA connection */
   /* Event channel, where connection management (cm) related events are relayed
    */
-  struct rdma_event_channel *cm_event_channel = nullptr;
-  struct rdma_cm_id *cm_server_id = nullptr;
-  struct ibv_pd *pd = nullptr;
-  struct ibv_comp_channel *io_completion_channel = nullptr;
-  struct ibv_cq *cq = nullptr;
-  struct ibv_qp_init_attr qp_init_attr;
-  struct ibv_qp *client_qp = nullptr;
-  /* RDMA memory resources */
-  struct ibv_mr *client_metadata_mr = nullptr, *server_buffer_mr = nullptr,
-                *server_metadata_mr = nullptr;
-  struct rdma_buffer_attr client_metadata_attr {};
-  struct rdma_buffer_attr server_metadata_attr {};
-  struct ibv_recv_wr client_recv_wr, *bad_client_recv_wr = nullptr;
-  struct ibv_send_wr server_send_wr, *bad_server_send_wr = nullptr;
-  struct ibv_sge client_recv_sge {};
-  struct ibv_sge server_send_sge {};
+  struct rdma_event_channel *cm_event_channel_ = nullptr;
+  struct rdma_cm_id *cm_server_id_ = nullptr;
 };
 
 int main(int argc, char *argv[]) {
