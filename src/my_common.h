@@ -36,6 +36,8 @@
 #define MAX_WR (8)
 /* Default port where the RDMA server is listening */
 #define DEFAULT_RDMA_PORT (20886)
+/* How many connections can be handled */
+#define CONN_DEPTH (8)
 
 /*
  * We use attribute so that compiler does not step in and try to pad the

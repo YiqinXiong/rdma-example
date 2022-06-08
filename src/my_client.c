@@ -304,8 +304,6 @@ static int client_disconnect_and_clean() {
   /* Destroy memory buffers */
   rdma_buffer_deregister(client_metadata_mr);
   rdma_buffer_deregister(client_buffer_mr);
-  /* We free the buffers */
-  free(buf);
   /* Destroy protection domain */
   ret = ibv_dealloc_pd(pd);
   if (ret) {
@@ -382,13 +380,13 @@ int main(int argc, char **argv) {
     return ret;
   }
 
-  print_array_data(buf);
-  printf("client_buffer_mr->addr=%p, buf addr=%p\n", client_buffer_mr->addr,
-         buf);
-
   ret = client_disconnect_and_clean();
   if (ret) {
     rdma_error("Failed to cleanly disconnect and clean up resources \n");
   }
+
+  print_array_data(buf);
+  /* We free the buffers */
+  free(buf);
   return ret;
 }

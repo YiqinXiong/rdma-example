@@ -18,7 +18,7 @@
 #include <vector>
 
 #include "ThreadPool.h"
-#include "rdma_common.h"
+#include "my_common.h"
 
 #define SERV_PORT 8411
 #define BACKLOG 32
@@ -203,10 +203,10 @@ static bool accept_client_connection(rdma_event_channel *cm_event_channel,
   memset(&conn_param, 0, sizeof(conn_param));
   /* this tell how many outstanding requests can we handle */
   conn_param.initiator_depth =
-      3; /* For this exercise, we put a small number here */
+      CONN_DEPTH; /* For this exercise, we put a small number here */
   /* This tell how many outstanding requests we expect other side to handle */
   conn_param.responder_resources =
-      3; /* For this exercise, we put a small number */
+      CONN_DEPTH; /* For this exercise, we put a small number */
   if (rdma_accept(client_rc.id, &conn_param)) {
     LOG(my_error, "Failed to accept the connection\n");
     return false;
