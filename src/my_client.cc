@@ -81,7 +81,7 @@ static int client_prepare_connection(client_resources &client_rc,
   ret = process_rdma_cm_event(client_rc.cm_event_channel,
                               RDMA_CM_EVENT_ADDR_RESOLVED, &cm_event);
   if (ret) {
-    printf("Failed to receive a valid event, ret = %d \n", ret);
+    printf("Failed to receive a valid event RDMA_CM_EVENT_ADDR_RESOLVED, ret = %d \n", ret);
     return ret;
   }
   /* we ack the event */
@@ -101,7 +101,7 @@ static int client_prepare_connection(client_resources &client_rc,
   ret = process_rdma_cm_event(client_rc.cm_event_channel,
                               RDMA_CM_EVENT_ROUTE_RESOLVED, &cm_event);
   if (ret) {
-    printf("Failed to receive a valid event, ret = %d \n", ret);
+    printf("Failed to receive a valid event RDMA_CM_EVENT_ROUTE_RESOLVED, ret = %d \n", ret);
     return ret;
   }
   /* we ack the event */
@@ -119,6 +119,8 @@ static int client_prepare_connection(client_resources &client_rc,
     printf("Failed to alloc pd, errno: %d \n", -errno);
     return -errno;
   }
+  printf("ibv_alloc_pd success!\n");
+  
   /* Now we need a completion channel, were the I/O completion
    * notifications are sent. Remember, this is different from connection
    * management (CM) event notifications.
@@ -201,7 +203,7 @@ static int client_connect_to_server(client_resources &client_rc) {
   ret = process_rdma_cm_event(client_rc.cm_event_channel,
                               RDMA_CM_EVENT_ESTABLISHED, &cm_event);
   if (ret) {
-    printf("Failed to get cm event, ret = %d \n", ret);
+    printf("Failed to get cm event RDMA_CM_EVENT_ESTABLISHED, ret = %d \n", ret);
     return ret;
   }
   ret = rdma_ack_cm_event(cm_event);
